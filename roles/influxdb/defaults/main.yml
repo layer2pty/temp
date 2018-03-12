@@ -1,0 +1,6 @@
+---
+# defaults file for influxdb
+    - name: Install influxdb
+      apt:
+       name: influxdb
+       state: lastest
