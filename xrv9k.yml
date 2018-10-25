@@ -1,0 +1,142 @@
+# Usage:
+#
+# ansible-playbook xrv9k_upgrade.yaml --extra-vars "hosts=iosxrv9000-1"
+#
+# ansible-playbook xrv9k_upgrade.yaml --extra-vars "hosts=iosxrv9000-1 image=xrv9k-fullk9-x-6.3.1"
+#
+# Note: ansible will execute task #1 across all hosts in parallel, then moves on to task #2
+#
+# TODO: skip the upgrade if version already installed
+
+---
+- hosts: '{{ hosts }}'
+  gather_facts: no
+  connection: local
+  
+  # TODO: put all vars in one place - either hosts or another playbook
+  
+  vars:
+    cli_login:
+      # if DNS is setup use "host: "{{ inventory_hostname }}"
+      host: "{{ hostvars[inventory_hostname].ansible_host }}"
+      username: "{{ login_uname }}"
+      password: "{{ login_pwd }}"
+      ssh_keyfile: "~/.ssh/id_rsa"
+      timeout: 60
+
+#  # ask user for input when vars not provided in CLI args
+#  vars_prompt:
+#
+#    - name: "hosts"
+#      prompt: |- 
+#                You can just press return for the default or enter a hostname
+#      private: no
+#      default: "iosxrv9000-1"
+#
+#    - name: "image"
+#      prompt: |- 
+#                Please enter the image filename
+#      private: no
+#      default: "xrv9k-fullk9-x-6.3.1"
+#      #default: "xrv9k-fullk9-x-6.2.3"
+      
+  tasks:
+    
+    # Simulate an error during device upgrade (change in routing table)
+    #  - if loopback22 exists we remove it, otherwise we add it to config
+
+
+    # TODO: add jinja template for 100 MPLS/VPNs and 1000 routes/vpn
+              
+    - name: "Check the status of interface Loopback22"
+      ignore_errors: True
+      no_log: False
+      iosxr_command:
+        commands: "sh int Loopback22 | i line protocol"
+        provider: "{{ cli_login }}"
+      register: intf_lo22
+      
+    - debug: msg="{{ intf_lo22.stdout_lines }}"
+
+    - name: "Shutdown intf Loopback22"
+      iosxr_config:
+        provider: "{{ cli_login }}"
+        lines:
+          - shutdown
+        parents: ['interface loopback 22']
+        match: exact
+      when: intf_lo22.stdout[0] | search("line protocol is up")
+
+    - name: "Unshut intf Loopback22"
+      iosxr_config:
+        provider: "{{ cli_login }}"
+        lines:
+          - no shutdown
+        parents: ['interface loopback 22']
+        match: exact
+      when: intf_lo22.stdout[0] | search("line protocol is administratively down")
+
+    # we end the playbook here - no real upgrade ...
+    - meta: end_play
+    
+    - name: "install remove inactive all"
+      ignore_errors: True
+      iosxr_install_package:
+        provider: "{{ cli_login }}"
+        pkgname: "all"
+        state: inactive
+      
+    # .iso is appended to pkg filename by iosxr_install_package module
+       
+    - name: "install add"
+      iosxr_install_package:
+        provider: "{{ cli_login }}"
+        pkgpath: "{{ image_url }}"
+        pkgname: "{{ image }}"
+        sftp_pwd: "{{ sftp_pwd }}"
+        state: present
+
+    - name: "install activate"
+      iosxr_install_package:
+        provider: "{{ cli_login }}"
+        pkgname: "{{ image }}"
+        state: activated
+
+    - name: "Wait for router to reload, then ping and install commit."
+      block:
+    
+        - name: "Wait until reload process starts (port 22 no longer reachable)"
+          ignore_errors: True
+          wait_for:
+              port: 22
+              host: "{{ hostvars[inventory_hostname].ansible_host }}"
+              timeout: 120
+              state: stopped
+                
+        - name: "Wait for router to reboot (port 22 reachable)"
+          ignore_errors: True
+          wait_for:
+              port: 22
+              host: "{{ hostvars[inventory_hostname].ansible_host }}"
+              timeout: 600
+              state: started
+
+        - name: "Allow 2min for router control-plane to initialise"
+          pause:
+            minutes: 2
+        
+        - name: "Verify internet connectivity from router (ping {{ ping_host }})"
+          iosxr_command:
+            commands: "ping {{ ping_host }}"
+            provider: "{{ cli_login }}"
+            wait_for:
+              - result[0] contains "!!!"
+           
+        - name: "install commit"
+          iosxr_install_package:
+            provider: "{{ cli_login }}"
+            pkgname: "all"
+            state: committed
+        
+      when: True
+          
